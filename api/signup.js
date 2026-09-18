@@ -52,6 +52,65 @@ function getSubnet(ip) {
   return ip;
 }
 
+// Step 3: after passing rate limits, subscribe the profile to the
+// Klaviyo list via the Bulk Subscribe Profiles job. This creates the
+// profile if needed, records marketing consent, and adds them to the
+// list in one call.
+
+const KLAVIYO_LIST_ID = 'SZV8sw'; // test list for now
+
+async function subscribeToKlaviyo(profileFields) {
+  const { email, first_name, last_name, address1, address2, city, region, zip } = profileFields;
+
+  const payload = {
+    data: {
+      type: 'profile-subscription-bulk-create-job',
+      attributes: {
+        custom_source: 'RedBaron Coupon Signup',
+        profiles: {
+          data: [
+            {
+              type: 'profile',
+              attributes: {
+                email,
+                first_name,
+                last_name,
+                location: { address1, address2, city, region, zip },
+                subscriptions: {
+                  email: { marketing: { consent: 'SUBSCRIBED' } },
+                },
+              },
+            },
+          ],
+        },
+      },
+      relationships: {
+        list: { data: { type: 'list', id: KLAVIYO_LIST_ID } },
+      },
+    },
+  };
+
+  const response = await fetch('https://a.klaviyo.com/api/profile-subscription-bulk-create-jobs', {
+    method: 'POST',
+    headers: {
+      Authorization: `Klaviyo-API-Key ${process.env.KLAVIYO_PRIVATE_API_KEY}`,
+      revision: '2026-01-15',
+      Accept: 'application/vnd.api+json',
+      'Content-Type': 'application/vnd.api+json',
+    },
+    body: JSON.stringify(payload),
+  });
+
+  if (!response.ok) {
+    const errorBody = await response.text();
+    console.log(`Klaviyo error ${response.status}: ${errorBody}`);
+    throw new Error(`Klaviyo subscribe failed: ${response.status}`);
+  }
+
+  // 202 with no body on success for this endpoint.
+  return response.status;
+}
+
 export default async function handler(req, res) {
   // CORS — required because the browser is POSTing from a Shopify
   // domain to this Vercel domain, a different origin.
@@ -106,12 +165,23 @@ export default async function handler(req, res) {
     });
   }
 
-  console.log(`PASSED rate limit checks — would issue coupon here (step 3)`);
+  console.log(`PASSED rate limit checks — subscribing to Klaviyo now`);
+
+  try {
+    const status = await subscribeToKlaviyo(body);
+    console.log(`Klaviyo accepted the job — status ${status}`);
+  } catch (err) {
+    console.log(`Klaviyo subscribe failed: ${err.message}`);
+    return res.status(502).json({
+      ok: false,
+      reason: 'klaviyo_error',
+      message: 'Something went wrong submitting your info. Please try again.',
+    });
+  }
 
   return res.status(200).json({
     ok: true,
-    message: 'Passed rate limit checks — no coupon issued yet (that\'s step 3)',
-    received: body,
+    message: 'Subscribed! Check the Klaviyo list to confirm.',
     debug: { ip, subnet, ipRemaining: ipCheck.remaining, subnetRemaining: subnetCheck.remaining },
   });
 }
