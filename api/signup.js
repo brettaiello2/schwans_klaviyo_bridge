@@ -61,15 +61,55 @@ function getSubnet(ip) {
   return ip;
 }
 
-// Step 3: after passing rate limits, subscribe the profile to the
-// Klaviyo list via the Bulk Subscribe Profiles job. This creates the
-// profile if needed, records marketing consent, and adds them to the
-// list in one call.
+// Step 3: after passing rate limits, do two things:
+//   1) upsert the profile's actual data (name, address) via the
+//      Create or Update Profile endpoint — this handles the
+//      "already exists" case automatically instead of erroring.
+//   2) subscribe them (consent + list membership) via the Bulk
+//      Subscribe Profiles job — this endpoint only accepts a narrow
+//      set of fields (email, phone_number, subscriptions), which is
+//      what caused the earlier 400 when we sent first_name/location
+//      here directly.
 
 const KLAVIYO_LIST_ID = 'SZV8sw'; // test list for now
 
-async function subscribeToKlaviyo(profileFields) {
+async function upsertKlaviyoProfile(profileFields) {
   const { email, first_name, last_name, address1, address2, city, region, zip } = profileFields;
+
+  const payload = {
+    data: {
+      type: 'profile',
+      attributes: {
+        email,
+        first_name,
+        last_name,
+        location: { address1, address2, city, region, zip },
+      },
+    },
+  };
+
+  const response = await fetch('https://a.klaviyo.com/api/profile-import/', {
+    method: 'POST',
+    headers: {
+      Authorization: `Klaviyo-API-Key ${process.env.KLAVIYO_PRIVATE_API_KEY}`,
+      revision: '2026-01-15',
+      Accept: 'application/vnd.api+json',
+      'Content-Type': 'application/vnd.api+json',
+    },
+    body: JSON.stringify(payload),
+  });
+
+  if (!response.ok) {
+    const errorBody = await response.text();
+    console.log(`Klaviyo profile-import error ${response.status}: ${errorBody}`);
+    throw new Error(`Klaviyo profile-import failed: ${response.status}`);
+  }
+
+  return response.status;
+}
+
+async function subscribeToKlaviyo(profileFields) {
+  const { email } = profileFields;
 
   const payload = {
     data: {
@@ -82,9 +122,6 @@ async function subscribeToKlaviyo(profileFields) {
               type: 'profile',
               attributes: {
                 email,
-                first_name,
-                last_name,
-                location: { address1, address2, city, region, zip },
                 subscriptions: {
                   email: { marketing: { consent: 'SUBSCRIBED' } },
                 },
@@ -112,7 +149,7 @@ async function subscribeToKlaviyo(profileFields) {
 
   if (!response.ok) {
     const errorBody = await response.text();
-    console.log(`Klaviyo error ${response.status}: ${errorBody}`);
+    console.log(`Klaviyo subscribe error ${response.status}: ${errorBody}`);
     throw new Error(`Klaviyo subscribe failed: ${response.status}`);
   }
 
@@ -174,13 +211,16 @@ export default async function handler(req, res) {
     });
   }
 
-  console.log(`PASSED rate limit checks — subscribing to Klaviyo now`);
+  console.log(`PASSED rate limit checks — writing to Klaviyo now`);
 
   try {
-    const status = await subscribeToKlaviyo(body);
-    console.log(`Klaviyo accepted the job — status ${status}`);
+    const importStatus = await upsertKlaviyoProfile(body);
+    console.log(`Klaviyo profile-import accepted — status ${importStatus}`);
+
+    const subStatus = await subscribeToKlaviyo(body);
+    console.log(`Klaviyo subscribe accepted — status ${subStatus}`);
   } catch (err) {
-    console.log(`Klaviyo subscribe failed: ${err.message}`);
+    console.log(`Klaviyo call failed: ${err.message}`);
     return res.status(502).json({
       ok: false,
       reason: 'klaviyo_error',
