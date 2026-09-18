@@ -19,6 +19,14 @@ const ipLimiter = new Ratelimit({
   redis,
   limiter: Ratelimit.slidingWindow(1, '30 d'),
   prefix: 'coupon:ip',
+  // Disabled: by default this keeps an in-memory cache of blocked IPs
+  // per warm function instance, separate from Redis. That's a fine
+  // optimization at scale, but it means deleting a key in Upstash's
+  // Data Browser doesn't actually clear a block until the function
+  // instance goes cold — confusing during testing, and harder to
+  // reason about across many concurrent instances in production.
+  // Redis alone is fast enough for this volume.
+  ephemeralCache: false,
 });
 
 // Tier 2: catches coordinated abuse across a small IP range (a
@@ -30,6 +38,7 @@ const subnetLimiter = new Ratelimit({
   redis,
   limiter: Ratelimit.slidingWindow(5, '30 d'),
   prefix: 'coupon:subnet',
+  ephemeralCache: false,
 });
 
 function getClientIp(req) {
