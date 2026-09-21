@@ -52,6 +52,26 @@ function getSubnet(ip) {
   return ip;
 }
 
+async function verifyRecaptcha(token, remoteIp) {
+  const params = new URLSearchParams();
+  params.append('secret', process.env.RECAPTCHA_SECRET_KEY);
+  params.append('response', token);
+  if (remoteIp && remoteIp !== 'unknown') {
+    params.append('remoteip', remoteIp);
+  }
+
+  const response = await fetch('https://www.google.com/recaptcha/api/siteverify', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+    body: params.toString(),
+  });
+
+  // Google's siteverify returns 200 with a success:false body on a bad
+  // token — it doesn't use HTTP error codes for that, so we always
+  // parse the body rather than checking response.ok here.
+  return response.json();
+}
+
 async function upsertKlaviyoProfile(profileAttributes) {
   // profileAttributes is the `profile` object custom-klaviyo-signup.js
   // already builds: { email, phone_number, first_name, last_name,
@@ -164,14 +184,26 @@ export default async function handler(req, res) {
     return res.status(400).json({ success: false, message: 'Please enter your email address.' });
   }
 
-  // TODO(step 4): verify recaptcha_token server-side with Google's
-  // siteverify endpoint before proceeding. Not implemented yet — right
-  // now this endpoint trusts that a token was present, but never
-  // confirms it's real. Anyone POSTing directly here (bypassing the
-  // widget) currently sails through this check.
+  // Verify the captcha BEFORE touching the rate limiter — a failed or
+  // missing token shouldn't burn the person's one allowed attempt.
   if (!recaptcha_token) {
-    console.log('WARNING: no recaptcha_token received — verification not implemented yet, allowing through');
+    return res.status(400).json({ success: false, message: 'Please complete the captcha.' });
   }
+
+  let captchaResult;
+  try {
+    captchaResult = await verifyRecaptcha(recaptcha_token, ip);
+  } catch (err) {
+    console.log(`reCAPTCHA verification request failed: ${err.message}`);
+    return res.status(502).json({ success: false, message: 'Something went wrong verifying the captcha. Please try again.' });
+  }
+
+  if (!captchaResult.success) {
+    console.log(`reCAPTCHA FAILED — error-codes: ${JSON.stringify(captchaResult['error-codes'])}`);
+    return res.status(400).json({ success: false, message: 'Captcha verification failed. Please try again.' });
+  }
+
+  console.log(`reCAPTCHA passed — hostname: ${captchaResult.hostname}`);
 
   const ipCheck = await ipLimiter.limit(ip);
   if (!ipCheck.success) {
