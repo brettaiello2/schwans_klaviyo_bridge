@@ -16,6 +16,14 @@ const ALLOWED_ORIGIN = '*';
 // arbitrary list.
 const KLAVIYO_LIST_ID = 'SZV8sw'; // test list for now
 
+// Total real, physical coupons available. Klaviyo's own uploaded
+// coupon list already guarantees no more than this many codes ever go
+// out (it skips the send once the list is empty) — this counter's job
+// is purely UX: stop new signups from succeeding once we're out, so
+// nobody gets a "you're signed up!" message that's followed by silence.
+const TOTAL_COUPONS = 10000;
+const COUNTER_KEY = 'coupon:total_success';
+
 const redis = Redis.fromEnv();
 
 // Tier 1: same person, same IP, resubmitting with different emails.
@@ -184,6 +192,20 @@ export default async function handler(req, res) {
     return res.status(400).json({ success: false, message: 'Please enter your email address.' });
   }
 
+  // Cheap early check — a plain read, not a reservation. Lets us bail
+  // out before spending a Google siteverify call or a rate-limit slot
+  // on someone we already know we'll turn away. The real, race-safe
+  // enforcement happens later via the atomic reserve.
+  const currentCount = Number(await redis.get(COUNTER_KEY)) || 0;
+  if (currentCount >= TOTAL_COUPONS) {
+    console.log(`SOLD OUT — current count ${currentCount} >= ${TOTAL_COUPONS}`);
+    return res.status(410).json({
+      success: false,
+      soldOut: true,
+      message: 'Sorry, all 10,000 coupons have been claimed!',
+    });
+  }
+
   // Verify the captcha BEFORE touching the rate limiter — a failed or
   // missing token shouldn't burn the person's one allowed attempt.
   if (!recaptcha_token) {
@@ -223,6 +245,23 @@ export default async function handler(req, res) {
     });
   }
 
+  // Atomic reservation: increment first, then check. This is the part
+  // that's actually race-safe under concurrent requests — two people
+  // hitting "submit" in the same instant can't both slip through on a
+  // plain read-then-write check, but INCR is atomic in Redis, so
+  // whoever's increment pushes the count over the limit is reliably
+  // the one who gets turned away and refunded.
+  const reservedCount = await redis.incr(COUNTER_KEY);
+  if (reservedCount > TOTAL_COUPONS) {
+    await redis.decr(COUNTER_KEY); // give the slot back, it wasn't used
+    console.log(`SOLD OUT at reservation time — count hit ${reservedCount}`);
+    return res.status(410).json({
+      success: false,
+      soldOut: true,
+      message: 'Sorry, all 10,000 coupons have been claimed!',
+    });
+  }
+
   // Build the profile object we'll send to Klaviyo. Fall back to just
   // { email } if the frontend didn't send a `profile` object for some
   // reason. Strip the reCAPTCHA response token if it snuck into
@@ -240,7 +279,7 @@ export default async function handler(req, res) {
     profileAttributes.email = email;
   }
 
-  console.log('PASSED rate limit checks — writing to Klaviyo now');
+  console.log(`PASSED all checks (reserved slot ${reservedCount}/${TOTAL_COUPONS}) — writing to Klaviyo now`);
 
   try {
     const importStatus = await upsertKlaviyoProfile(profileAttributes);
@@ -249,7 +288,10 @@ export default async function handler(req, res) {
     const subStatus = await subscribeToKlaviyo(email);
     console.log(`Klaviyo subscribe accepted — status ${subStatus}`);
   } catch (err) {
-    console.log(`Klaviyo call failed: ${err.message}`);
+    // Klaviyo failed, so this person didn't actually get subscribed —
+    // release the reserved slot so the count stays accurate.
+    await redis.decr(COUNTER_KEY);
+    console.log(`Klaviyo call failed, released reserved slot: ${err.message}`);
     return res.status(502).json({
       success: false,
       message: 'Something went wrong submitting your info. Please try again.',
