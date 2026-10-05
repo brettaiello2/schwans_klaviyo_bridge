@@ -6,7 +6,7 @@
 import { Redis } from '@upstash/redis';
 
 const ALLOWED_ORIGIN = '*'; // tighten alongside the same setting in signup.js
-const TOTAL_COUPONS = 10000;
+const TOTAL_COUPONS = 5;
 const COUNTER_KEY = 'coupon:total_success';
 
 const redis = Redis.fromEnv();
