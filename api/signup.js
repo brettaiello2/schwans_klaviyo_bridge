@@ -14,7 +14,7 @@ const ALLOWED_ORIGIN = '*';
 // client-supplied list_id would let anyone who calls this endpoint
 // directly (bypassing the on-page form) redirect signups to an
 // arbitrary list.
-const KLAVIYO_LIST_ID = 'SZV8sw'; // test list for now
+const KLAVIYO_LIST_ID = 'WaYvi6'; // test list for now
 
 // Total real, physical coupons available. Klaviyo's own uploaded
 // coupon list already guarantees no more than this many codes ever go
