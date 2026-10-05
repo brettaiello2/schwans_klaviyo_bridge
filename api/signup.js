@@ -21,7 +21,7 @@ const KLAVIYO_LIST_ID = 'SZV8sw'; // test list for now
 // out (it skips the send once the list is empty) — this counter's job
 // is purely UX: stop new signups from succeeding once we're out, so
 // nobody gets a "you're signed up!" message that's followed by silence.
-const TOTAL_COUPONS = 10000;
+const TOTAL_COUPONS = 5;
 const COUNTER_KEY = 'coupon:total_success';
 
 const redis = Redis.fromEnv();
