@@ -1,7 +1,9 @@
 // Vercel serverless function backing the RED BARON coupon signup form.
 // Receives the payload built by custom-klaviyo-signup.js, applies
-// IP + subnet rate limiting, then writes the profile to Klaviyo and
-// subscribes it to the campaign list.
+// captcha + IP/subnet rate limiting, then writes the profile to Klaviyo
+// and subscribes it to a list. The first TOTAL_COUPONS successful
+// signups go to the coupon list; everyone after that goes to the
+// overflow list with a different success message.
 
 import { Ratelimit } from '@upstash/ratelimit';
 import { Redis } from '@upstash/redis';
@@ -16,11 +18,17 @@ const ALLOWED_ORIGIN = '*';
 // arbitrary list.
 const KLAVIYO_LIST_ID = 'WaYvi6';
 
+// Entrants after the coupons run out are added to this list instead.
+// This list should NOT be the trigger for the coupon flow.
+const OVERFLOW_LIST_ID = 'TBGbsH';
+
+const SUCCESS_MESSAGE = 'Congratulations, you are signed up! Check your email for your coupon.';
+const OVERFLOW_MESSAGE = 'Congratulations, you are signed up!';
+
 // Total real, physical coupons available. Klaviyo's own uploaded
 // coupon list already guarantees no more than this many codes ever go
-// out (it skips the send once the list is empty) — this counter's job
-// is purely UX: stop new signups from succeeding once we're out, so
-// nobody gets a "you're signed up!" message that's followed by silence.
+// out (it skips the send once the list is empty) — this counter decides
+// which list a new signup lands on and which message they see.
 const TOTAL_COUPONS = 10000;
 const COUNTER_KEY = 'coupon:total_success';
 
@@ -114,7 +122,7 @@ async function upsertKlaviyoProfile(profileAttributes) {
   return response.status;
 }
 
-async function subscribeToKlaviyo(email) {
+async function subscribeToKlaviyo(email, listId) {
   // This endpoint only accepts a narrow field set on the nested
   // profile object (email, phone_number, subscriptions) — name and
   // address go through upsertKlaviyoProfile instead. This call's job
@@ -139,7 +147,7 @@ async function subscribeToKlaviyo(email) {
         },
       },
       relationships: {
-        list: { data: { type: 'list', id: KLAVIYO_LIST_ID } },
+        list: { data: { type: 'list', id: listId } },
       },
     },
   };
@@ -192,18 +200,13 @@ export default async function handler(req, res) {
     return res.status(400).json({ success: false, message: 'Please enter your email address.' });
   }
 
-  // Cheap early check — a plain read, not a reservation. Lets us bail
-  // out before spending a Google siteverify call or a rate-limit slot
-  // on someone we already know we'll turn away. The real, race-safe
-  // enforcement happens later via the atomic reserve.
+  // Cheap early read (not a reservation): are we already past the cap?
+  // This only sets the starting assumption — the race-safe decision
+  // happens at the atomic reserve below.
   const currentCount = Number(await redis.get(COUNTER_KEY)) || 0;
-  if (currentCount >= TOTAL_COUPONS) {
-    console.log(`SOLD OUT — current count ${currentCount} >= ${TOTAL_COUPONS}`);
-    return res.status(410).json({
-      success: false,
-      soldOut: true,
-      message: 'Sorry, all 10,000 coupons have been claimed!',
-    });
+  let isOverflow = currentCount >= TOTAL_COUPONS;
+  if (isOverflow) {
+    console.log(`OVERFLOW — current count ${currentCount} >= ${TOTAL_COUPONS}, signup will go to the overflow list`);
   }
 
   // Verify the captcha BEFORE touching the rate limiter — a failed or
@@ -257,20 +260,30 @@ export default async function handler(req, res) {
 
   // Atomic reservation: increment first, then check. This is the part
   // that's actually race-safe under concurrent requests — two people
-  // hitting "submit" in the same instant can't both slip through on a
-  // plain read-then-write check, but INCR is atomic in Redis, so
-  // whoever's increment pushes the count over the limit is reliably
-  // the one who gets turned away and refunded.
-  const reservedCount = await redis.incr(COUNTER_KEY);
-  if (reservedCount > TOTAL_COUPONS) {
-    await redis.decr(COUNTER_KEY); // give the slot back, it wasn't used
-    console.log(`SOLD OUT at reservation time — count hit ${reservedCount}`);
-    return res.status(410).json({
+  // hitting "submit" in the same instant can't both get the last coupon
+  // slot, because INCR is atomic in Redis. Whoever's increment pushes
+  // the count over the limit gets the slot refunded and is routed to
+  // the overflow list instead of being turned away.
+  let reservedCount = null;
+  if (!isOverflow) {
+    reservedCount = await redis.incr(COUNTER_KEY);
+    if (reservedCount > TOTAL_COUPONS) {
+      await redis.decr(COUNTER_KEY); // give the slot back, it wasn't used
+      reservedCount = null;
+      isOverflow = true;
+      console.log('OVERFLOW at reservation time — coupons ran out during this request');
+    }
+  }
+
+  if (isOverflow && OVERFLOW_LIST_ID.startsWith('REPLACE')) {
+    console.log('CONFIG ERROR: OVERFLOW_LIST_ID has not been set');
+    return res.status(502).json({
       success: false,
-      soldOut: true,
-      message: 'Sorry, all 10,000 coupons have been claimed!',
+      message: 'Something went wrong submitting your info. Please try again.',
     });
   }
+
+  const targetListId = isOverflow ? OVERFLOW_LIST_ID : KLAVIYO_LIST_ID;
 
   // Build the profile object we'll send to Klaviyo. Fall back to just
   // { email } if the frontend didn't send a `profile` object for some
@@ -289,18 +302,24 @@ export default async function handler(req, res) {
     profileAttributes.email = email;
   }
 
-  console.log(`PASSED all checks (reserved slot ${reservedCount}/${TOTAL_COUPONS}) — writing to Klaviyo now`);
+  console.log(
+    isOverflow
+      ? `PASSED all checks (overflow) — writing to Klaviyo list ${targetListId}`
+      : `PASSED all checks (reserved slot ${reservedCount}/${TOTAL_COUPONS}) — writing to Klaviyo list ${targetListId}`
+  );
 
   try {
     const importStatus = await upsertKlaviyoProfile(profileAttributes);
     console.log(`Klaviyo profile-import accepted — status ${importStatus}`);
 
-    const subStatus = await subscribeToKlaviyo(email);
+    const subStatus = await subscribeToKlaviyo(email, targetListId);
     console.log(`Klaviyo subscribe accepted — status ${subStatus}`);
   } catch (err) {
     // Klaviyo failed, so this person didn't actually get subscribed —
-    // release the reserved slot so the count stays accurate.
-    await redis.decr(COUNTER_KEY);
+    // release the reserved slot (if we took one) so the count stays accurate.
+    if (reservedCount !== null) {
+      await redis.decr(COUNTER_KEY);
+    }
     console.log(`Klaviyo call failed, released reserved slot: ${err.message}`);
     return res.status(502).json({
       success: false,
@@ -310,6 +329,7 @@ export default async function handler(req, res) {
 
   return res.status(200).json({
     success: true,
-    message: 'Congratulations, you are signed up! Check your email for your coupon.',
+    overflow: isOverflow,
+    message: isOverflow ? OVERFLOW_MESSAGE : SUCCESS_MESSAGE,
   });
 }
