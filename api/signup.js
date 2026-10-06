@@ -14,7 +14,7 @@ const ALLOWED_ORIGIN = '*';
 // client-supplied list_id would let anyone who calls this endpoint
 // directly (bypassing the on-page form) redirect signups to an
 // arbitrary list.
-const KLAVIYO_LIST_ID = 'WaYvi6'; // test list for now
+const KLAVIYO_LIST_ID = 'WaYvi6';
 
 // Total real, physical coupons available. Klaviyo's own uploaded
 // coupon list already guarantees no more than this many codes ever go
@@ -227,22 +227,32 @@ export default async function handler(req, res) {
 
   console.log(`reCAPTCHA passed — hostname: ${captchaResult.hostname}`);
 
-  const ipCheck = await ipLimiter.limit(ip);
-  if (!ipCheck.success) {
-    console.log(`BLOCKED — IP ${ip} already used its allowance`);
-    return res.status(429).json({
-      success: false,
-      message: 'This IP address has already claimed a coupon.',
-    });
-  }
+  // Toggle: set RATE_LIMIT_ENABLED=false in Vercel env vars to
+  // temporarily disable IP/subnet rate limiting without touching
+  // code. Defaults to enabled if the var is unset or anything other
+  // than the literal string "false".
+  const rateLimitEnabled = process.env.RATE_LIMIT_ENABLED !== 'false';
 
-  const subnetCheck = await subnetLimiter.limit(subnet);
-  if (!subnetCheck.success) {
-    console.log(`BLOCKED — subnet ${subnet} exceeded its allowance`);
-    return res.status(429).json({
-      success: false,
-      message: 'Too many signups from this network. Please try again later.',
-    });
+  if (rateLimitEnabled) {
+    const ipCheck = await ipLimiter.limit(ip);
+    if (!ipCheck.success) {
+      console.log(`BLOCKED — IP ${ip} already used its allowance`);
+      return res.status(429).json({
+        success: false,
+        message: 'This IP address has already claimed a coupon.',
+      });
+    }
+
+    const subnetCheck = await subnetLimiter.limit(subnet);
+    if (!subnetCheck.success) {
+      console.log(`BLOCKED — subnet ${subnet} exceeded its allowance`);
+      return res.status(429).json({
+        success: false,
+        message: 'Too many signups from this network. Please try again later.',
+      });
+    }
+  } else {
+    console.log('RATE LIMITING DISABLED via RATE_LIMIT_ENABLED=false — skipping IP/subnet checks');
   }
 
   // Atomic reservation: increment first, then check. This is the part
