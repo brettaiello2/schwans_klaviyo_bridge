@@ -310,6 +310,6 @@ export default async function handler(req, res) {
 
   return res.status(200).json({
     success: true,
-    message: 'Thanks, you are signed up! Check your email for your coupon.',
+    message: 'Congratulations, you are signed up! Check your email for your coupon.',
   });
 }
