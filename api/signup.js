@@ -23,7 +23,7 @@ const KLAVIYO_LIST_ID = 'WaYvi6';
 const OVERFLOW_LIST_ID = 'TBGbsH';
 
 const SUCCESS_MESSAGE = 'Congratulations, you are signed up! Check your email for your coupon.';
-const OVERFLOW_MESSAGE = 'Congratulations, you are signed up!';
+const OVERFLOW_MESSAGE = "Congratulations! You are now entered to win our Grand Prize and if youre one of the first 10K entries, you'll receive a free pizza coupon.";
 
 // Total real, physical coupons available. Klaviyo's own uploaded
 // coupon list already guarantees no more than this many codes ever go
